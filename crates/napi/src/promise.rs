@@ -1,3 +1,4 @@
+use napi_sys::napi_threadsafe_function_call_js;
 use std::ffi::CStr;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -47,6 +48,7 @@ impl<Data, Resolver: FnOnce(sys::napi_env, Data) -> Result<sys::napi_value>>
     let env = self.env;
     let self_ref = Box::leak(Box::from(self));
     check_status!(unsafe {
+      // DEBUG: disable this for debug
       sys::napi_create_threadsafe_function(
         env,
         ptr::null_mut(),
@@ -58,6 +60,7 @@ impl<Data, Resolver: FnOnce(sys::napi_env, Data) -> Result<sys::napi_value>>
         None,
         self_ref as *mut FuturePromise<Data, Resolver> as *mut c_void,
         Some(call_js_cb::<Data, Resolver>),
+        // call_js_cb::<Data, Resolver> as *mut c_void,
         &mut tsfn_value,
       )
     })?;

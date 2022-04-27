@@ -190,7 +190,7 @@ test('class constructor return Result', (t) => {
   t.is(c.method(), 'not empty')
 })
 
-test('class Factory return Result', (t) => {
+('class Factory return Result', (t) => {
   const c = Context.withData('not empty')
   t.is(c.method(), 'not empty')
 })

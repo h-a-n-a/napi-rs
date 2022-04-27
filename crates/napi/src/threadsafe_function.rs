@@ -1,5 +1,6 @@
 #![allow(clippy::single_component_path_imports)]
 
+use napi_sys::napi_threadsafe_function_call_js;
 use std::convert::Into;
 use std::ffi::CString;
 use std::marker::PhantomData;
@@ -9,7 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::bindgen_runtime::ToNapiValue;
-use crate::{check_status, sys, Env, Error, JsError, Result, Status};
+use crate::{
+  check_status, sys, Env, Error, JsError, JsFunction, JsObject, NapiRaw, NapiValue, Result, Status,
+};
 
 /// ThreadSafeFunction Context object
 /// the `value` is the value passed to `call` method
@@ -145,7 +148,7 @@ type_level_enum! {
 /// }
 /// ```
 pub struct ThreadsafeFunction<T: 'static, ES: ErrorStrategy::T = ErrorStrategy::CalleeHandled> {
-  raw_tsfn: sys::napi_threadsafe_function,
+  pub raw_tsfn: sys::napi_threadsafe_function,
   aborted: Arc<AtomicBool>,
   ref_count: Arc<AtomicUsize>,
   _phantom: PhantomData<(T, ES)>,
@@ -173,6 +176,206 @@ impl<T: 'static, ES: ErrorStrategy::T> Clone for ThreadsafeFunction<T, ES> {
 unsafe impl<T, ES: ErrorStrategy::T> Send for ThreadsafeFunction<T, ES> {}
 unsafe impl<T, ES: ErrorStrategy::T> Sync for ThreadsafeFunction<T, ES> {}
 
+unsafe extern "C" fn custom_call_js_cb<T: 'static, V: ToNapiValue, R, ES>(
+  raw_env: sys::napi_env,
+  js_callback: sys::napi_value,
+  context: *mut c_void,
+  data: *mut c_void,
+) where
+  R: 'static + Send + FnMut(ThreadSafeCallContext<T>) -> Result<Vec<V>>,
+  ES: ErrorStrategy::T,
+{
+  // env and/or callback can be null when shutting down
+  if raw_env.is_null() || js_callback.is_null() {
+    return;
+  }
+
+  let ctx: &mut R = unsafe { &mut *context.cast::<R>() };
+  let val: Result<T> = unsafe {
+    match ES::VALUE {
+      ErrorStrategy::CalleeHandled::VALUE => *Box::<Result<T>>::from_raw(data.cast()),
+      ErrorStrategy::Fatal::VALUE => Ok(*Box::<T>::from_raw(data.cast())),
+    }
+  };
+
+  let mut recv = ptr::null_mut();
+  unsafe { sys::napi_get_undefined(raw_env, &mut recv) };
+
+  let ret = val.and_then(|v| {
+    (ctx)(ThreadSafeCallContext {
+      env: unsafe { Env::from_raw(raw_env) },
+      value: v,
+    })
+  });
+
+  let mut result = ptr::null_mut();
+
+  // Follow async callback conventions: https://nodejs.org/en/knowledge/errors/what-are-the-error-conventions/
+  // Check if the Result is okay, if so, pass a null as the first (error) argument automatically.
+  // If the Result is an error, pass that as the first argument.
+  let status = match ret {
+    Ok(values) => {
+      let values = values
+        .into_iter()
+        .map(|v| unsafe { ToNapiValue::to_napi_value(raw_env, v) });
+      let args: Result<Vec<sys::napi_value>> = if ES::VALUE == ErrorStrategy::CalleeHandled::VALUE {
+        let mut js_null = ptr::null_mut();
+        unsafe { sys::napi_get_null(raw_env, &mut js_null) };
+        ::core::iter::once(Ok(js_null)).chain(values).collect()
+      } else {
+        values.collect()
+      };
+      match args {
+        Ok(args) => unsafe {
+          sys::napi_call_function(
+            raw_env,
+            recv,
+            js_callback,
+            args.len(),
+            args.as_ptr(),
+            result as *mut _,
+          )
+        },
+        Err(e) => match ES::VALUE {
+          ErrorStrategy::Fatal::VALUE => unsafe {
+            sys::napi_fatal_exception(raw_env, JsError::from(e).into_value(raw_env))
+          },
+          ErrorStrategy::CalleeHandled::VALUE => unsafe {
+            sys::napi_call_function(
+              raw_env,
+              recv,
+              js_callback,
+              1,
+              [JsError::from(e).into_value(raw_env)].as_mut_ptr(),
+              result as *mut _,
+            )
+          },
+        },
+      }
+    }
+    Err(e) if ES::VALUE == ErrorStrategy::Fatal::VALUE => unsafe {
+      sys::napi_fatal_exception(raw_env, JsError::from(e).into_value(raw_env))
+    },
+    Err(e) => unsafe {
+      sys::napi_call_function(
+        raw_env,
+        recv,
+        js_callback,
+        1,
+        [JsError::from(e).into_value(raw_env)].as_mut_ptr(),
+        result as *mut _,
+      )
+    },
+  };
+  // let result = unsafe { crate::JsNumber::from_raw(raw_env, return_value) };
+  // let val = result.unwrap().get_int32();
+  // println!("{:#?}", val);
+
+  if status == sys::Status::napi_ok {
+    return;
+  }
+  if status == sys::Status::napi_pending_exception {
+    let mut error_result = ptr::null_mut();
+    assert_eq!(
+      unsafe { sys::napi_get_and_clear_last_exception(raw_env, &mut error_result) },
+      sys::Status::napi_ok
+    );
+
+    // When shutting down, napi_fatal_exception sometimes returns another exception
+    let stat = unsafe { sys::napi_fatal_exception(raw_env, error_result) };
+    assert!(stat == sys::Status::napi_ok || stat == sys::Status::napi_pending_exception);
+  } else {
+    let error_code: Status = status.into();
+    let error_code_string = format!("{:?}", error_code);
+    let mut error_code_value = ptr::null_mut();
+    assert_eq!(
+      unsafe {
+        sys::napi_create_string_utf8(
+          raw_env,
+          error_code_string.as_ptr() as *const _,
+          error_code_string.len(),
+          &mut error_code_value,
+        )
+      },
+      sys::Status::napi_ok,
+    );
+    let error_msg = "Call JavaScript callback failed in thread safe function";
+    let mut error_msg_value = ptr::null_mut();
+    assert_eq!(
+      unsafe {
+        sys::napi_create_string_utf8(
+          raw_env,
+          error_msg.as_ptr() as *const _,
+          error_msg.len(),
+          &mut error_msg_value,
+        )
+      },
+      sys::Status::napi_ok,
+    );
+    let mut error_value = ptr::null_mut();
+    assert_eq!(
+      unsafe {
+        sys::napi_create_error(raw_env, error_code_value, error_msg_value, &mut error_value)
+      },
+      sys::Status::napi_ok,
+    );
+    assert_eq!(
+      unsafe { sys::napi_fatal_exception(raw_env, error_value) },
+      sys::Status::napi_ok
+    );
+  }
+}
+
+unsafe extern "C" fn custom_call_js_cb_internal(
+  env: sys::napi_env,
+  info: sys::napi_callback_info,
+) -> sys::napi_value {
+  println!("fooooooo");
+
+  let mut data = ptr::null_mut();
+  let mut napi_call_js_cb_args: [napi_sys::napi_value; 4] = [ptr::null_mut(); 4];
+  let mut this = ptr::null_mut();
+  let mut argc = 1;
+
+  let get_cb_info_status = unsafe {
+    napi_sys::napi_get_cb_info(
+      env,
+      info,
+      &mut argc,
+      napi_call_js_cb_args.as_mut_ptr(),
+      &mut this,
+      &mut data,
+    )
+  };
+
+  println!("get cb info {:?}", napi_call_js_cb_args);
+
+  debug_assert!(
+    get_cb_info_status == sys::Status::napi_ok,
+    "failed to get callback info for napi threadsafe custom js callback"
+  );
+
+  // unsafe { crate::JsObject::new(env).unwrap().raw() }
+  // let a = unsafe { *Box::<sys::napi_value>::from_raw(data.cast()) };
+  // println!("foo a {:#?}", a);
+
+  // let args = vec![];
+  // let mut return_value = ptr::null_mut();
+  //
+  // sys::napi_call_function(
+  //   raw_env,
+  //   recv,
+  //   js_callback,
+  //   args.len(),
+  //   args.as_ptr(),
+  //   &mut return_value,
+  // );
+
+  // println!("return value of js callback {:?}", return_value);
+
+  unsafe { JsObject::new(env).unwrap().raw() }
+}
+
 impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
   /// See [napi_create_threadsafe_function](https://nodejs.org/api/n-api.html#n_api_napi_create_threadsafe_function)
   /// for more information.
@@ -195,22 +398,101 @@ impl<T: 'static, ES: ErrorStrategy::T> ThreadsafeFunction<T, ES> {
 
     let initial_thread_count = 1usize;
     let mut raw_tsfn = ptr::null_mut();
-    let ptr = Box::into_raw(Box::new(callback)) as *mut c_void;
+    let callback_ptr = Box::into_raw(Box::new(callback)) as *mut c_void;
+
+    let mut async_context = ptr::null_mut();
+    let async_resource = ptr::null_mut();
+    // See: https://github.com/nodejs/node/blob/bc47eb38491e65cf5730bba1fcb7de19c74dbdf9/src/node_api.cc#L846
+    let raw_this = Box::into_raw(Box::new(crate::JsObject::new(env).unwrap())) as *mut _;
+
     check_status!(unsafe {
-      sys::napi_create_threadsafe_function(
+      sys::napi_async_init(env, async_resource, async_resource_name, &mut async_context)
+    })?;
+
+    // let mut js_cb = ptr::null_mut();
+    let mut js_function_for_cb = ptr::null_mut();
+    let data = Box::into_raw(Box::new(crate::JsObject::new(env).unwrap()));
+
+    let s = "napi_rs_threadsafe_call_js_cb";
+    let len = s.len();
+    let s = CString::new(s)?;
+    println!("heihei");
+
+    // let arg = vec![];
+
+    check_status!(unsafe {
+      sys::napi_create_function(
+        env,
+        s.as_ptr(),
+        len,
+        Some(custom_call_js_cb_internal),
+        ptr::null_mut(),
+        &mut js_function_for_cb,
+      )
+    })?;
+    println!("js function for cb {:?}", js_function_for_cb);
+
+    // let args: Vec<sys::napi_value> = vec![
+    //   // env as *mut _,
+    //   func as *mut _,
+    //   js_function_for_cb as *mut _,
+    //   data as *mut _,
+    //   // js_function_for_cb as *mut _,
+    // ];
+    //
+    // check_status!(unsafe {
+    //   println!("env {:#?}", env);
+    //   println!("async_context {:#?}", async_context);
+    //   println!("raw_this {:#?}", raw_this);
+    //   println!("js cb before {:?}", js_cb);
+    //   println!("arg {:#?}", args);
+    //
+    //   let status = sys::napi_make_callback(
+    //     env,
+    //     async_context,
+    //     raw_this,
+    //     js_function_for_cb,
+    //     args.len(),
+    //     args.as_ptr(),
+    //     &mut js_cb,
+    //   );
+    //   println!("js cb after {:?} status {:?}", js_cb, status);
+    //
+    //   status
+    // })?;
+
+    check_status!(unsafe {
+      let status = sys::napi_create_threadsafe_function(
         env,
         func,
-        ptr::null_mut(),
+        async_resource,
         async_resource_name,
         max_queue_size,
         initial_thread_count,
-        ptr,
+        callback_ptr,
         Some(thread_finalize_cb::<T, V, R>),
-        ptr,
-        Some(call_js_cb::<T, V, R, ES>),
+        callback_ptr,
+        Some(unsafe { std::mem::transmute(js_function_for_cb) }),
         &mut raw_tsfn,
-      )
+      );
+
+      println!(
+        "create threadsafe function status {} {:?}",
+        status, raw_tsfn
+      );
+
+      status
     })?;
+
+    match unsafe { crate::JsFunction::from_raw(env, js_function_for_cb as sys::napi_value) } {
+      Ok(func) => {
+        println!("raw env {:?}", env);
+        println!("raw jsfunc {:?}", js_function_for_cb);
+        println!("jsfunc env {:?}", func.0.env);
+        println!("jsfunc value {:?}", func.0.value);
+      }
+      _ => (),
+    };
 
     let aborted = Arc::new(AtomicBool::new(false));
     let aborted_ptr = Arc::into_raw(aborted.clone()) as *mut c_void;
@@ -374,6 +656,8 @@ unsafe extern "C" fn call_js_cb<T: 'static, V: ToNapiValue, R, ES>(
     })
   });
 
+  let mut return_value = ptr::null_mut();
+
   // Follow async callback conventions: https://nodejs.org/en/knowledge/errors/what-are-the-error-conventions/
   // Check if the Result is okay, if so, pass a null as the first (error) argument automatically.
   // If the Result is an error, pass that as the first argument.
@@ -397,7 +681,7 @@ unsafe extern "C" fn call_js_cb<T: 'static, V: ToNapiValue, R, ES>(
             js_callback,
             args.len(),
             args.as_ptr(),
-            ptr::null_mut(),
+            &mut return_value,
           )
         },
         Err(e) => match ES::VALUE {
@@ -411,7 +695,7 @@ unsafe extern "C" fn call_js_cb<T: 'static, V: ToNapiValue, R, ES>(
               js_callback,
               1,
               [JsError::from(e).into_value(raw_env)].as_mut_ptr(),
-              ptr::null_mut(),
+              &mut return_value,
             )
           },
         },
@@ -427,10 +711,11 @@ unsafe extern "C" fn call_js_cb<T: 'static, V: ToNapiValue, R, ES>(
         js_callback,
         1,
         [JsError::from(e).into_value(raw_env)].as_mut_ptr(),
-        ptr::null_mut(),
+        &mut return_value,
       )
     },
   };
+
   if status == sys::Status::napi_ok {
     return;
   }

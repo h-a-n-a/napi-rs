@@ -927,6 +927,7 @@ pub type napi_threadsafe_function_call_js = Option<
     data: *mut c_void,
   ),
 >;
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct napi_node_version {
