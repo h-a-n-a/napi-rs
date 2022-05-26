@@ -396,7 +396,7 @@ unsafe extern "C" fn call_js_cb<T: 'static, V: ToNapiValue, R, RE, ES>(
 
   let ctx = unsafe { &mut *context.cast::<[sys::napi_value; 2]>() };
   let native_passed_cb: &mut R = unsafe { &mut *ctx[0].cast::<R>() };
-  let native_result_cbs: &mut Mutex<ThreadsafeFunctionResultCallback<RE>> =
+  let native_result_cbs: &mut Vec<ThreadsafeFunctionResultCallback<RE>> =
     unsafe { &mut *ctx[1].cast::<Vec<ThreadsafeFunctionResultCallback<RE>>>() };
 
   let mut return_value = ptr::null_mut();
