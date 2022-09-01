@@ -78,6 +78,14 @@ export function createExternal(size: number): ExternalObject<number>
 export function createExternalString(content: string): ExternalObject<string>
 export function getExternal(external: ExternalObject<number>): number
 export function mutateExternal(external: ExternalObject<number>, newVal: number): void
+export interface A {
+  b: B
+}
+export interface B {
+  num: number
+}
+export function createExternalVal(): ExternalObject<A>
+export function mutateExternalVal(external: ExternalObject<A>): void
 export function validateArray(arr: Array<number>): number
 export function validateBuffer(b: Buffer): number
 export function validateTypedArray(input: Uint8Array): number
@@ -211,6 +219,7 @@ export class Bird {
 export type Blake2bHasher = Blake2BHasher
 /** Smoking test for type generation */
 export class Blake2BHasher {
+  static withKey(key: Blake2bKey): Blake2BHasher
   update(data: Buffer): void
 }
 export type Blake2bKey = Blake2BKey
@@ -258,6 +267,7 @@ export class JsClassForEither {
   constructor()
 }
 export class Fib {
+  [Symbol.iterator](): Iterator<number, void, number>
   constructor()
 }
 export class Fib2 {
