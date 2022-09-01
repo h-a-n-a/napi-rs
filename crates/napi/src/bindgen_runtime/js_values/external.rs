@@ -74,13 +74,13 @@ impl<T: 'static> FromNapiValue for External<T> {
 }
 
 impl<T: 'static> AsRef<T> for External<T> {
-  fn as_ref(&self) -> &T {
+  fn as_ref(&self) -> &'static T {
     unsafe { Box::leak(Box::from_raw(self.obj)).object.as_ref().unwrap() }
   }
 }
 
 impl<T: 'static> AsMut<T> for External<T> {
-  fn as_mut(&mut self) -> &mut T {
+  fn as_mut(&mut self) -> &'static mut T {
     unsafe { Box::leak(Box::from_raw(self.obj)).object.as_mut().unwrap() }
   }
 }
